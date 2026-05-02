@@ -1,46 +1,31 @@
 package com.jellypudding.discordRelay;
 
-import io.papermc.paper.event.player.AsyncChatEvent;
+import com.jellypudding.discordRelay.discord.DiscordBotListener;
+import com.jellypudding.discordRelay.listeners.ChatListener;
+import com.jellypudding.discordRelay.listeners.PlayerListener;
+import com.jellypudding.discordRelay.utils.ChromaTagUtil;
+import com.jellypudding.discordRelay.utils.WordFilterUtil;
+import net.dv8tion.jda.api.EmbedBuilder;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
-import net.dv8tion.jda.api.entities.Member;
-import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
-import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
-import net.dv8tion.jda.api.hooks.ListenerAdapter;
 import net.dv8tion.jda.api.interactions.commands.OptionType;
 import net.dv8tion.jda.api.interactions.commands.build.Commands;
 import net.dv8tion.jda.api.requests.GatewayIntent;
-import net.dv8tion.jda.api.EmbedBuilder;
-import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
-import org.bukkit.entity.Player;
-import org.bukkit.event.EventHandler;
-import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
-import org.bukkit.event.Listener;
-import org.bukkit.event.entity.PlayerDeathEvent;
-import org.bukkit.event.player.PlayerJoinEvent;
-import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 
-import com.jellypudding.discordRelay.utils.ChromaTagUtil;
-import com.jellypudding.discordRelay.utils.WordFilterUtil;
-
 import java.awt.Color;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
-import java.util.Set;
-import java.util.stream.Collectors;
 
-public class DiscordRelay extends JavaPlugin implements Listener {
+public class DiscordRelay extends JavaPlugin {
 
     private JDA jda;
     private String discordChannelId;
@@ -51,6 +36,22 @@ public class DiscordRelay extends JavaPlugin implements Listener {
 
     public boolean isPluginConfigured() {
         return isConfigured;
+    }
+
+    public String getDiscordChannelId() {
+        return discordChannelId;
+    }
+
+    public ChromaTagUtil getChromaTagUtil() {
+        return chromaTagUtil;
+    }
+
+    public long getStartTime() {
+        return startTime;
+    }
+
+    public WordFilterUtil getWordFilterUtil() {
+        return wordFilterUtil;
     }
 
     private void loadConfig() {
@@ -75,10 +76,7 @@ public class DiscordRelay extends JavaPlugin implements Listener {
         List<String> filterWords = getConfig().getStringList("word-filter.words");
         wordFilterUtil = new WordFilterUtil(filterEnabled, filterWords);
 
-        // Start cache cleanup task (runs every 20 minutes)
-        Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
-            chromaTagUtil.cleanupCache();
-        }, 24000L, 24000L);
+        Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> chromaTagUtil.cleanupCache(), 24000L, 24000L);
 
         if (isConfigured) {
             initialisePlugin(false);
@@ -98,7 +96,8 @@ public class DiscordRelay extends JavaPlugin implements Listener {
 
     private void registerListeners() {
         HandlerList.unregisterAll((JavaPlugin) this);
-        getServer().getPluginManager().registerEvents(this, this);
+        getServer().getPluginManager().registerEvents(new ChatListener(this), this);
+        getServer().getPluginManager().registerEvents(new PlayerListener(this), this);
     }
 
     private void connectToDiscord(boolean isReload) {
@@ -109,11 +108,10 @@ public class DiscordRelay extends JavaPlugin implements Listener {
             }
             jda = JDABuilder.createDefault(getConfig().getString("discord-bot-token"))
                     .enableIntents(GatewayIntent.MESSAGE_CONTENT, GatewayIntent.GUILD_MEMBERS)
-                    .addEventListeners(new DiscordListener())
+                    .addEventListeners(new DiscordBotListener(this))
                     .build();
             jda.awaitReady();
 
-            // Register the slash commands
             jda.updateCommands().addCommands(
                     Commands.slash("list", "Get a list of online players"),
                     Commands.slash("uptime", "Get the server's uptime"),
@@ -138,8 +136,7 @@ public class DiscordRelay extends JavaPlugin implements Listener {
 
             if (!isReload) {
                 sendToDiscord("**Server is starting up!**");
-                int pluginId = 27558;
-                new Metrics(this, pluginId);
+                new Metrics(this, 27558);
             }
 
         } catch (Exception e) {
@@ -174,35 +171,15 @@ public class DiscordRelay extends JavaPlugin implements Listener {
         HandlerList.unregisterAll((JavaPlugin) this);
     }
 
-    @EventHandler(priority = EventPriority.HIGHEST)
-    public void onPlayerChat(AsyncChatEvent event) {
-        if (!isConfigured) return;
-
-        if (event.isCancelled()) return;
-
-        if (event.isAsynchronous()) {
-            String playerName = event.getPlayer().getName();
-            String message = PlainTextComponentSerializer.plainText().serialize(event.message());
-            sendPlayerMessageToDiscord(playerName, message);
-        } else {
-            getServer().getScheduler().runTaskAsynchronously(this, () -> {
-                String playerName = event.getPlayer().getName();
-                String message = PlainTextComponentSerializer.plainText().serialize(event.message());
-                sendPlayerMessageToDiscord(playerName, message);
-            });
-        }
-    }
-
-    private void sendPlayerMessageToDiscord(String playerName, String message) {
+    public void sendPlayerMessageToDiscord(String playerName, String message) {
         if (jda != null) {
             TextChannel channel = jda.getTextChannelById(discordChannelId);
             if (channel != null) {
-                String filteredMessage = wordFilterUtil.filterMessage(message);
-                
+                String filtered = escapeMarkdown(wordFilterUtil.filterMessage(message));
                 String avatarUrl = String.format("https://mc-heads.net/avatar/%s", playerName);
                 EmbedBuilder embed = new EmbedBuilder()
                         .setAuthor(playerName, null, avatarUrl)
-                        .setDescription(filteredMessage)
+                        .setDescription(filtered)
                         .setColor(Color.YELLOW);
                 channel.sendMessageEmbeds(embed.build()).queue();
             } else {
@@ -211,9 +188,35 @@ public class DiscordRelay extends JavaPlugin implements Listener {
         }
     }
 
-    private void sendPlayerEventToDiscord(String playerName, String action, Color color) {
-        if (!isConfigured) return;
+    public void sendMeMessageToDiscord(String playerName, String emoteText) {
+        if (jda != null) {
+            TextChannel channel = jda.getTextChannelById(discordChannelId);
+            if (channel != null) {
+                String filtered = escapeMarkdown(wordFilterUtil.filterMessage(emoteText));
+                String avatarUrl = String.format("https://mc-heads.net/avatar/%s", playerName);
+                EmbedBuilder embed = new EmbedBuilder()
+                        .setAuthor(playerName, null, avatarUrl)
+                        .setDescription("_" + escapeMarkdown(playerName) + " " + filtered + "_")
+                        .setColor(new Color(128, 0, 128));
+                channel.sendMessageEmbeds(embed.build()).queue();
+            } else {
+                getLogger().warning("Discord channel not found!");
+            }
+        }
+    }
 
+    private static String escapeMarkdown(String text) {
+        if (text == null) return null;
+        return text.replace("\\", "\\\\")
+                   .replace("*", "\\*")
+                   .replace("_", "\\_")
+                   .replace("~", "\\~")
+                   .replace("`", "\\`")
+                   .replace("|", "\\|");
+    }
+
+    public void sendPlayerEventToDiscord(String playerName, String action, Color color) {
+        if (!isConfigured) return;
         if (jda != null) {
             TextChannel channel = jda.getTextChannelById(discordChannelId);
             if (channel != null) {
@@ -228,38 +231,15 @@ public class DiscordRelay extends JavaPlugin implements Listener {
         }
     }
 
-    @EventHandler(priority = EventPriority.HIGHEST)
-    public void onPlayerJoin(PlayerJoinEvent event) {
-        String playerName = event.getPlayer().getName();
-        sendPlayerEventToDiscord(playerName, "joined the game", Color.GREEN);
-    }
-
-    @EventHandler(priority = EventPriority.HIGHEST)
-    public void onPlayerQuit(PlayerQuitEvent event) {
-        String playerName = event.getPlayer().getName();
-        sendPlayerEventToDiscord(playerName, "left the game", Color.RED);
-    }
-
-    @EventHandler(priority = EventPriority.HIGHEST)
-    public void onPlayerDeath(PlayerDeathEvent event) {
-        String playerName = event.getEntity().getName();
-        String deathMessage = event.deathMessage() != null
-                ? PlainTextComponentSerializer.plainText().serialize(Objects.requireNonNull(event.deathMessage()))
-                : playerName + " died";
-        sendDeathMessageToDiscord(playerName, deathMessage);
-    }
-
-    private void sendDeathMessageToDiscord(String playerName, String deathMessage) {
+    public void sendDeathMessageToDiscord(String playerName, String deathMessage) {
         if (!isConfigured) return;
-
         if (jda != null) {
             TextChannel channel = jda.getTextChannelById(discordChannelId);
             if (channel != null) {
-                String filteredDeathMessage = wordFilterUtil.filterMessage(deathMessage);
-
+                String filtered = wordFilterUtil.filterMessage(deathMessage);
                 String avatarUrl = String.format("https://mc-heads.net/avatar/%s", playerName);
                 EmbedBuilder embed = new EmbedBuilder()
-                        .setAuthor(filteredDeathMessage, null, avatarUrl)
+                        .setAuthor(filtered, null, avatarUrl)
                         .setColor(Color.GRAY);
                 channel.sendMessageEmbeds(embed.build()).queue();
             } else {
@@ -268,9 +248,8 @@ public class DiscordRelay extends JavaPlugin implements Listener {
         }
     }
 
-    private void sendToDiscord(String message) {
+    public void sendToDiscord(String message) {
         if (!isConfigured) return;
-
         if (jda != null) {
             TextChannel channel = jda.getTextChannelById(discordChannelId);
             if (channel != null) {
@@ -283,52 +262,49 @@ public class DiscordRelay extends JavaPlugin implements Listener {
 
     @Override
     public boolean onCommand(@NotNull CommandSender sender, Command command, @NotNull String label, String[] args) {
-        if (command.getName().equalsIgnoreCase("discordrelay")) {
-            if (args.length > 0 && args[0].equalsIgnoreCase("reload")) {
-                if (sender.hasPermission("discordrelay.reload")) {
-                    reloadPlugin();
-                    sender.sendMessage("DiscordRelay plugin reloaded.");
-                    return true;
-                } else {
-                    sender.sendMessage("You don't have permission to reload DiscordRelay.");
-                    return true;
-                }
-            } else if (args.length > 2 && args[0].equalsIgnoreCase("send")) {
-                if (sender.hasPermission("discordrelay.send")) {
-                    String colourName = args[1].toLowerCase();
-                    String fullMessage = String.join(" ", java.util.Arrays.copyOfRange(args, 2, args.length));
+        if (!command.getName().equalsIgnoreCase("discordrelay")) return false;
 
-                    Color colour = parseColour(colourName);
-                    if (colour == null) {
-                        sender.sendMessage("Invalid colour! Available colours: red, green, blue, yellow, orange, purple, pink, grey, white, black");
-                        return true;
-                    }
-
-                    // Check if message contains a title (format: "Title: message")
-                    String title = "Server Message";
-                    String message = fullMessage;
-
-                    if (fullMessage.contains(":")) {
-                        String[] parts = fullMessage.split(":", 2);
-                        if (parts.length == 2 && !parts[0].trim().isEmpty() && !parts[1].trim().isEmpty()) {
-                            title = parts[0].trim();
-                            message = parts[1].trim();
-                        }
-                    }
-
-                    relayFormattedMessage(title, message, colour);
-                    sender.sendMessage("Message sent to Discord with " + colourName + " colour!");
-                    return true;
-                } else {
-                    sender.sendMessage("You don't have permission to send messages to Discord.");
-                    return true;
-                }
+        if (args.length > 0 && args[0].equalsIgnoreCase("reload")) {
+            if (sender.hasPermission("discordrelay.reload")) {
+                reloadPlugin();
+                sender.sendMessage("DiscordRelay plugin reloaded.");
             } else {
-                sender.sendMessage("Usage: /discordrelay reload | /discordrelay send <colour> <message>");
-                return true;
+                sender.sendMessage("You don't have permission to reload DiscordRelay.");
             }
+            return true;
         }
-        return false;
+
+        if (args.length > 2 && args[0].equalsIgnoreCase("send")) {
+            if (sender.hasPermission("discordrelay.send")) {
+                String colourName = args[1].toLowerCase();
+                String fullMessage = String.join(" ", java.util.Arrays.copyOfRange(args, 2, args.length));
+
+                Color colour = parseColour(colourName);
+                if (colour == null) {
+                    sender.sendMessage("Invalid colour! Available colours: red, green, blue, yellow, orange, purple, pink, grey, white, black");
+                    return true;
+                }
+
+                String title = "Server Message";
+                String message = fullMessage;
+                if (fullMessage.contains(":")) {
+                    String[] parts = fullMessage.split(":", 2);
+                    if (parts.length == 2 && !parts[0].trim().isEmpty() && !parts[1].trim().isEmpty()) {
+                        title = parts[0].trim();
+                        message = parts[1].trim();
+                    }
+                }
+
+                relayFormattedMessage(title, message, colour);
+                sender.sendMessage("Message sent to Discord with " + colourName + " colour!");
+            } else {
+                sender.sendMessage("You don't have permission to send messages to Discord.");
+            }
+            return true;
+        }
+
+        sender.sendMessage("Usage: /discordrelay reload | /discordrelay send <colour> <message>");
+        return true;
     }
 
     private void reloadPlugin() {
@@ -357,362 +333,66 @@ public class DiscordRelay extends JavaPlugin implements Listener {
     }
 
     public List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command, @NotNull String alias, String[] args) {
-        if (command.getName().equalsIgnoreCase("discordrelay")) {
-            if (args.length == 1) {
-                List<String> completions = new ArrayList<>();
-                completions.add("reload");
-                completions.add("send");
-                return completions;
-            } else if (args.length == 2 && args[0].equalsIgnoreCase("send")) {
-                List<String> colours = new ArrayList<>();
-                colours.add("red");
-                colours.add("green");
-                colours.add("blue");
-                colours.add("yellow");
-                colours.add("orange");
-                colours.add("purple");
-                colours.add("pink");
-                colours.add("grey");
-                colours.add("white");
-                colours.add("black");
-                return colours;
-            }
+        if (!command.getName().equalsIgnoreCase("discordrelay")) return null;
+        if (args.length == 1) {
+            return List.of("reload", "send");
+        }
+        if (args.length == 2 && args[0].equalsIgnoreCase("send")) {
+            return List.of("red", "green", "blue", "yellow", "orange", "purple", "pink", "grey", "white", "black");
         }
         return null;
     }
 
     private Color parseColour(String colourName) {
-        switch (colourName.toLowerCase()) {
-            case "red": return Color.RED;
-            case "green": return Color.GREEN;
-            case "blue": return Color.BLUE;
-            case "yellow": return Color.YELLOW;
-            case "orange": return Color.ORANGE;
-            case "purple": return new Color(128, 0, 128);
-            case "pink": return Color.PINK;
-            case "grey": case "gray": return Color.GRAY;
-            case "white": return Color.WHITE;
-            case "black": return Color.BLACK;
-            default: return null;
-        }
+        return switch (colourName.toLowerCase()) {
+            case "red"          -> Color.RED;
+            case "green"        -> Color.GREEN;
+            case "blue"         -> Color.BLUE;
+            case "yellow"       -> Color.YELLOW;
+            case "orange"       -> Color.ORANGE;
+            case "purple"       -> new Color(128, 0, 128);
+            case "pink"         -> Color.PINK;
+            case "grey", "gray" -> Color.GRAY;
+            case "white"        -> Color.WHITE;
+            case "black"        -> Color.BLACK;
+            default             -> null;
+        };
     }
 
-    private class DiscordListener extends ListenerAdapter {
-        @Override
-        public void onSlashCommandInteraction(SlashCommandInteractionEvent event) {
-            if (event.getName().equals("list")) {
-                event.deferReply().queue();
-                sendPlayerList(event);
-            } else if (event.getName().equals("uptime")) {
-                event.deferReply().queue();
-                sendUptime(event);
-            } else if (event.getName().equals("tps")) {
-                event.deferReply().queue();
-                sendTPS(event);
-            } else if (event.getName().equals("firstseen") || event.getName().equals("lastseen") ||
-                       event.getName().equals("timeplayed") || event.getName().equals("chatter") ||
-                       event.getName().equals("kills") || event.getName().equals("deaths")) {
-                event.deferReply().queue();
-                sendPlayerStat(event);
-            } else if (event.getName().equals("reputation")) {
-                event.deferReply().queue();
-                sendPlayerReputation(event);
-            }
-        }
-
-        @Override
-        public void onMessageReceived(MessageReceivedEvent event) {
-            if (event.getChannel().getId().equals(discordChannelId) && !event.getAuthor().isBot()) {
-                Member member = event.getMember();
-                String name = (member != null && member.getNickname() != null) ? member.getNickname() : event.getAuthor().getName();
-                String discordMessageContent = event.getMessage().getContentDisplay();
-
-                net.kyori.adventure.text.Component discordPrefix = net.kyori.adventure.text.Component.text("[Discord] ")
-                        .color(net.kyori.adventure.text.format.NamedTextColor.GRAY);
-
-                net.kyori.adventure.text.Component playerNameComponent = chromaTagUtil.getColoredPlayerNameComponent(name);
-
-                net.kyori.adventure.text.Component messageComponent = net.kyori.adventure.text.Component.text(": " + discordMessageContent)
-                        .color(net.kyori.adventure.text.format.NamedTextColor.WHITE);
-
-                net.kyori.adventure.text.Component fullMessage = discordPrefix.append(playerNameComponent).append(messageComponent);
-
-                if (Bukkit.getPluginManager().isPluginEnabled("BedrockSupport")) {
-                    try {
-                        String plainMessageForAPI = String.format("[Discord] %s: %s", name, discordMessageContent);
-                        com.jellypudding.fakePlayers.FakePlayersAPI.addExternalMessage(plainMessageForAPI);
-                    } catch (NoClassDefFoundError e) {
-                        getLogger().warning("Could not forward Discord message to FakePlayers. Is it installed and enabled correctly?");
-                    } catch (Exception e) {
-                        getLogger().warning("Error forwarding Discord message to FakePlayers: " + e.getMessage());
-                    }
-                }
-
-                Bukkit.getScheduler().runTask(DiscordRelay.this, () ->
-                        Bukkit.broadcast(fullMessage)
-                );
-            }
-        }
-
-        private void sendPlayerList(SlashCommandInteractionEvent event) {
-            List<String> realPlayerNames = Bukkit.getOnlinePlayers().stream()
-                    .map(Player::getName)
-                    .collect(Collectors.toList());
-
-            List<String> fakePlayerNames = new ArrayList<>();
-            if (Bukkit.getPluginManager().isPluginEnabled("BedrockSupport")) {
-                try {
-                    Set<String> currentFakes = com.jellypudding.fakePlayers.FakePlayersAPI.getCurrentFakePlayerNames();
-                    if (currentFakes != null) {
-                        fakePlayerNames.addAll(currentFakes);
-                    }
-                } catch (NoClassDefFoundError e) {
-                    getLogger().warning("Could not get fake player list for /list command. Is FakePlayers (BedrockSupport) installed and enabled correctly?");
-                } catch (Exception e) {
-                    getLogger().warning("Error getting fake player list for /list command: " + e.getMessage());
-                }
-            }
-
-            List<String> allPlayerNames = new ArrayList<>(realPlayerNames);
-            allPlayerNames.addAll(fakePlayerNames);
-            Collections.sort(allPlayerNames, String.CASE_INSENSITIVE_ORDER);
-
-            int totalPlayerCount = allPlayerNames.size();
-            String playerListString = totalPlayerCount == 0 ? "No players online." : allPlayerNames.stream()
-                    .map(name -> escapeMarkdown(name))
-                    .collect(Collectors.joining(", "));
-            String message = String.format("Online players (%d): %s", totalPlayerCount, playerListString);
-
-            EmbedBuilder embed = new EmbedBuilder()
-                    .setTitle("Player List")
-                    .setDescription(message)
-                    .setColor(Color.BLUE);
-
-            event.getHook().sendMessageEmbeds(embed.build()).queue();
-        }
-
-        private void sendUptime(SlashCommandInteractionEvent event) {
-            long uptime = System.currentTimeMillis() - startTime;
-            long days = uptime / (1000 * 60 * 60 * 24);
-            long hours = (uptime / (1000 * 60 * 60)) % 24;
-            long minutes = (uptime / (1000 * 60)) % 60;
-            long seconds = (uptime / 1000) % 60;
-
-            String uptimeString = String.format("%d days, %d hours, %d minutes, %d seconds", days, hours, minutes, seconds);
-
-            EmbedBuilder embed = new EmbedBuilder()
-                    .setTitle("Server Uptime")
-                    .setDescription(uptimeString)
-                    .setColor(Color.GREEN);
-
-            event.getHook().sendMessageEmbeds(embed.build()).queue();
-        }
-
-        private void sendTPS(SlashCommandInteractionEvent event) {
-            double[] tps = Bukkit.getTPS();
-
-            double tps1min = tps.length > 0 ? Math.min(Math.round(tps[0] * 100.0) / 100.0, 20.0) : 0.0;
-            double tps5min = tps.length > 1 ? Math.min(Math.round(tps[1] * 100.0) / 100.0, 20.0) : 0.0;
-            double tps15min = tps.length > 2 ? Math.min(Math.round(tps[2] * 100.0) / 100.0, 20.0) : 0.0;
-            
-            String description = String.format("**1 minute:** %.2f TPS\n**5 minutes:** %.2f TPS\n**15 minutes:** %.2f TPS", 
-                    tps1min, tps5min, tps15min);
-            
-            // Choose colour based on worst TPS.
-            double worstTPS = Math.min(Math.min(tps1min, tps5min), tps15min);
-            Color color = worstTPS >= 18.0 ? Color.GREEN : worstTPS >= 15.0 ? Color.YELLOW : Color.RED;
-
-            EmbedBuilder embed = new EmbedBuilder()
-                    .setTitle("Server TPS")
-                    .setDescription(description)
-                    .setColor(color);
-
-            event.getHook().sendMessageEmbeds(embed.build()).queue();
-        }
-
-        private void sendPlayerStat(SlashCommandInteractionEvent event) {
-            String playerName = event.getOption("name").getAsString();
-            String commandName = event.getName();
-            String statType = getStatTypeFromCommand(commandName);
-
-            withOfflineStatsAPI(event, playerName, api -> {
-                String formattedStat = api.getFormattedStat(playerName, statType);
-
-                EmbedBuilder embed = new EmbedBuilder();
-                if (formattedStat == null || formattedStat.isEmpty()) {
-                    embed.setTitle("No Data Found")
-                            .setDescription("No data found for player: " + escapeMarkdown(playerName))
-                            .setColor(Color.RED);
-                } else {
-                    embed.setTitle("Player Statistics")
-                            .setDescription(escapeMarkdown(formattedStat))
-                            .setColor(Color.GREEN);
-                }
-                return embed;
-            });
-        }
-
-        private String getStatTypeFromCommand(String commandName) {
-            switch (commandName.toLowerCase()) {
-                case "firstseen": return "firstseen";
-                case "lastseen": return "lastseen";
-                case "timeplayed": return "timeplayed";
-                case "chatter": return "chatter";
-                case "kills": return "kills";
-                case "deaths": return "deaths";
-                default: return "";
-            }
-        }
-
-        private void sendPlayerReputation(SlashCommandInteractionEvent event) {
-            String playerName = event.getOption("player").getAsString();
-
-            withOfflineStatsAPI(event, playerName, api -> {
-                var stats = api.getPlayerStats(playerName);
-
-                EmbedBuilder embed = new EmbedBuilder();
-                if (stats == null) {
-                    embed.setTitle("No Data Found")
-                            .setDescription("No data found for player: " + escapeMarkdown(playerName))
-                            .setColor(Color.RED);
-                } else {
-                    int netRep = stats.getNetRep();
-                    int positiveRep = stats.getPositiveRep();
-                    int negativeRep = stats.getNegativeRep();
-
-                    String description = String.format("%s has %d reputation (+%d/-%d)",
-                            escapeMarkdown(stats.getUsername()), netRep, positiveRep, negativeRep);
-
-                    Color color;
-                    if (netRep > 0) {
-                        color = Color.GREEN;
-                    } else if (netRep < 0) {
-                        color = Color.RED;
-                    } else {
-                        color = Color.WHITE;
-                    }
-
-                    embed.setTitle("Player Reputation")
-                            .setDescription(description)
-                            .setColor(color);
-                }
-                return embed;
-            });
-        }
-
-        @FunctionalInterface
-        private interface OfflineStatsTask {
-            EmbedBuilder execute(com.jellypudding.offlineStats.api.OfflineStatsAPI api) throws Exception;
-        }
-
-        private void withOfflineStatsAPI(SlashCommandInteractionEvent event, String playerName, OfflineStatsTask task) {
-            if (!Bukkit.getPluginManager().isPluginEnabled("OfflineStats")) {
-                EmbedBuilder embed = new EmbedBuilder()
-                        .setTitle("Error")
-                        .setDescription("OfflineStats plugin is not enabled.")
-                        .setColor(Color.RED);
-                event.getHook().sendMessageEmbeds(embed.build()).queue();
-                return;
-            }
-
-            try {
-                com.jellypudding.offlineStats.OfflineStats offlineStatsPlugin =
-                    (com.jellypudding.offlineStats.OfflineStats) Bukkit.getPluginManager().getPlugin("OfflineStats");
-                com.jellypudding.offlineStats.api.OfflineStatsAPI api = offlineStatsPlugin.getAPI();
-
-                getServer().getScheduler().runTaskAsynchronously(DiscordRelay.this, () -> {
-                    try {
-                        EmbedBuilder embed = task.execute(api);
-                        event.getHook().sendMessageEmbeds(embed.build()).queue();
-                    } catch (Exception e) {
-                        EmbedBuilder embed = new EmbedBuilder()
-                                .setTitle("Error")
-                                .setDescription("Error retrieving data for " + escapeMarkdown(playerName) + ": " + e.getMessage())
-                                .setColor(Color.RED);
-                        event.getHook().sendMessageEmbeds(embed.build()).queue();
-                    }
-                });
-            } catch (NoClassDefFoundError e) {
-                getLogger().warning("Could not access OfflineStats. Is it installed and enabled correctly?");
-                EmbedBuilder embed = new EmbedBuilder()
-                        .setTitle("Error")
-                        .setDescription("OfflineStats plugin is not available.")
-                        .setColor(Color.RED);
-                event.getHook().sendMessageEmbeds(embed.build()).queue();
-            } catch (Exception e) {
-                getLogger().warning("Error accessing OfflineStats: " + e.getMessage());
-                EmbedBuilder embed = new EmbedBuilder()
-                        .setTitle("Error")
-                        .setDescription("Error accessing OfflineStats: " + e.getMessage())
-                        .setColor(Color.RED);
-                event.getHook().sendMessageEmbeds(embed.build()).queue();
-            }
-        }
-
-        private static String escapeMarkdown(String text) {
-            if (text == null) return null;
-            return text.replace("\\", "\\\\")
-                       .replace("*", "\\*")
-                       .replace("_", "\\_")
-                       .replace("~", "\\~")
-                       .replace("`", "\\`")
-                       .replace("|", "\\|");
-        }
-    }
-
-    // --- Public API Methods ---
-
-    /** For DiscordRelayAPI: Relays player join event */
     public void relayPlayerJoin(String playerName) {
         if (!isConfigured) return;
         sendPlayerEventToDiscord(playerName, "joined the game", Color.GREEN);
     }
 
-    /** For DiscordRelayAPI: Relays player leave event */
     public void relayPlayerLeave(String playerName) {
         if (!isConfigured) return;
         sendPlayerEventToDiscord(playerName, "left the game", Color.RED);
     }
 
-    /** For DiscordRelayAPI: Relays player chat message */
     public void relayPlayerMessage(String playerName, String message) {
         if (!isConfigured) return;
         sendPlayerMessageToDiscord(playerName, message);
     }
 
-    /** For DiscordRelayAPI: Relays player death message */
     public void relayPlayerDeath(String playerName, String deathMessage) {
         if (!isConfigured) return;
         sendDeathMessageToDiscord(playerName, deathMessage);
     }
 
-    /** For DiscordRelayAPI: Sends a custom message to Discord */
     public void relayCustomMessage(String message) {
         if (!isConfigured) return;
         sendToDiscord(message);
     }
 
-    /** For DiscordRelayAPI: Sends a formatted embed message to Discord */
     public void relayFormattedMessage(String title, String description, Color colour) {
         if (!isConfigured) return;
-
         if (jda != null) {
             TextChannel channel = jda.getTextChannelById(discordChannelId);
             if (channel != null) {
                 EmbedBuilder embed = new EmbedBuilder();
-
-                if (title != null && !title.trim().isEmpty()) {
-                    embed.setTitle(title);
-                }
-
-                if (description != null && !description.trim().isEmpty()) {
-                    embed.setDescription(description);
-                }
-
-                if (colour != null) {
-                    embed.setColor(colour);
-                }
-
+                if (title != null && !title.trim().isEmpty()) embed.setTitle(title);
+                if (description != null && !description.trim().isEmpty()) embed.setDescription(description);
+                if (colour != null) embed.setColor(colour);
                 channel.sendMessageEmbeds(embed.build()).queue();
             } else {
                 getLogger().warning("Discord channel not found!");

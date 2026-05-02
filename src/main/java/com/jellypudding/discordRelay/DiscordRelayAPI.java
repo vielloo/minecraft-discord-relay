@@ -4,9 +4,6 @@ import org.bukkit.Bukkit;
 import java.awt.Color;
 import java.util.logging.Level;
 
-/**
- * API class for other plugins to interact with DiscordRelay.
- */
 public class DiscordRelayAPI {
 
     private static DiscordRelay pluginInstance = null;
